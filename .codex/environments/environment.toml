@@ -20,7 +20,7 @@ OLLAMA_MAX_TOKENS=1600 uv run uvicorn research_agent.server:APP --host 127.0.0.1
 '''
 
 [[actions]]
-name = "Sub-Agent"
+name = "Research Agent"
 icon = "tool"
 command = '''
 # Install Python deps for the research agent
