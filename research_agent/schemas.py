@@ -31,6 +31,7 @@ class AgentResponse(BaseModel):
     open_questions: List[str]
     sources: List[AgentSource]
     raw: Optional[dict] = None
+    metadata: Optional[dict] = None
 
 
 class PlanQuery(BaseModel):

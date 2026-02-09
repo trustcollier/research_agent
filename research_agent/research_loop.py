@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import random
@@ -30,6 +31,9 @@ MIN_RESULTS_PER_QUERY = 3
 DEFAULT_TOKEN_BUDGET = 120000
 DEFAULT_COMPACT_KEEP_RECENT = 20
 DEFAULT_COMPACT_BEFORE_SYNTH = False
+DEFAULT_LLM_MAX_TOKENS = 800
+TRACE_DIR = Path(__file__).resolve().parent.parent / "temporary" / "traces"
+CACHE_DIR = Path(__file__).resolve().parent.parent / "temporary" / "cache"
 LOW_QUALITY_DOMAINS = (
     "piechartmaker.com",
     "sqmagazine.co.uk",
@@ -61,6 +65,57 @@ def _parse_json(content: str) -> Dict:
     return json.loads(content)
 
 
+def _ensure_dirs() -> None:
+    TRACE_DIR.mkdir(parents=True, exist_ok=True)
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _hash_text(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _run_id(task: str) -> str:
+    normalized = " ".join(task.strip().lower().split())
+    return _hash_text(normalized)[:16]
+
+
+def _cache_path(prefix: str, key: str) -> Path:
+    return CACHE_DIR / f"{prefix}_{key}.json"
+
+
+def _load_cache(prefix: str, key: str) -> Optional[dict]:
+    path = _cache_path(prefix, key)
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def _save_cache(prefix: str, key: str, payload: dict) -> None:
+    _cache_path(prefix, key).write_text(json.dumps(payload), encoding="utf-8")
+
+
+def _llm_cache_key(*, system: str, prompt: str, model: str, temperature: float, max_tokens: int) -> str:
+    key_payload = json.dumps(
+        {
+            "system": system,
+            "prompt": prompt,
+            "model": model,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+        },
+        sort_keys=True,
+    )
+    return _hash_text(key_payload)
+
+
+def _search_cache_key(query: str, limit: int) -> str:
+    key_payload = json.dumps({"query": query, "limit": limit}, sort_keys=True)
+    return _hash_text(key_payload)
+
+
 def _to_agent_error(reason: str, raw: Optional[dict] = None) -> AgentResponse:
     return AgentResponse(
         summary=f"ERROR: {reason}",
@@ -70,7 +125,15 @@ def _to_agent_error(reason: str, raw: Optional[dict] = None) -> AgentResponse:
         open_questions=[],
         sources=[],
         raw=raw,
+        metadata=None,
     )
+
+
+def _write_trace(trace: Dict[str, object]) -> None:
+    if not trace.get("run_id"):
+        return
+    trace_path = TRACE_DIR / f"{trace['run_id']}.json"
+    trace_path.write_text(json.dumps(trace, indent=2), encoding="utf-8")
 
 
 def _format_sources_for_reflection(sources: List[AgentSource]) -> str:
@@ -198,6 +261,30 @@ def _growth_covered(sources: List[AgentSource]) -> bool:
     return False
 
 
+def _storage_focus_required(task: str) -> bool:
+    lowered = task.lower()
+    return "cloud storage" in lowered or "file sharing" in lowered or "storage providers" in lowered
+
+
+def _infra_market_source(source: AgentSource) -> bool:
+    text = f"{source.title} {source.location}".lower()
+    infra_markers = (
+        "cloud infrastructure",
+        "iaas",
+        "aws",
+        "azure",
+        "google cloud",
+        "cloud platform",
+    )
+    return "market share" in text and any(marker in text for marker in infra_markers)
+
+
+def _storage_focus_missing(sources: List[AgentSource]) -> bool:
+    if not sources:
+        return True
+    return all(_infra_market_source(source) for source in sources)
+
+
 def _growth_query_fallback(task: str) -> List[PlanQuery]:
     return [
         PlanQuery(
@@ -223,6 +310,23 @@ def _growth_query_fallback(task: str) -> List[PlanQuery]:
     ]
 
 
+def _storage_focus_query_fallback() -> List[PlanQuery]:
+    return [
+        PlanQuery(
+            query="cloud storage market share consumer personal 2024 2025",
+            intent="focus on consumer/personal cloud storage market share",
+        ),
+        PlanQuery(
+            query="file sharing software market share by vendor 2024 site:statista.com",
+            intent="use file-sharing vendor shares as proxy",
+        ),
+        PlanQuery(
+            query="Dropbox Google Drive OneDrive market share personal cloud storage",
+            intent="target provider-specific storage market share",
+        ),
+    ]
+
+
 def _has_authoritative_sources(sources: List[AgentSource]) -> bool:
     domains = ("statista.com", "gartner.com", "idc.com", "techcrunch.com", "theverge.com", "bloomberg.com")
     for source in sources:
@@ -230,6 +334,30 @@ def _has_authoritative_sources(sources: List[AgentSource]) -> bool:
         if any(domain in location for domain in domains):
             return True
     return False
+
+
+def _fallback_queries(task: str) -> List[PlanQuery]:
+    return [
+        PlanQuery(query=f"{task} market share 2024 2025", intent="core market share query"),
+        PlanQuery(query=f"{task} year-over-year growth 2024 2025", intent="growth query"),
+        PlanQuery(query=f"{task} statistics 2024 2025 site:statista.com", intent="authoritative source query"),
+    ]
+
+
+def _normalize_query(text: str) -> str:
+    return " ".join(text.strip().split())
+
+
+def _dedupe_sort_queries(queries: List[PlanQuery]) -> List[PlanQuery]:
+    seen = set()
+    unique: List[PlanQuery] = []
+    for query in queries:
+        normalized = _normalize_query(query.query)
+        if not normalized or normalized.lower() in seen:
+            continue
+        seen.add(normalized.lower())
+        unique.append(PlanQuery(query=normalized, intent=query.intent))
+    return sorted(unique, key=lambda q: q.query.lower())
 
 
 def _validate_citations(
@@ -287,6 +415,19 @@ def run_research(
     if not task:
         return _to_agent_error("task is required")
 
+    _ensure_dirs()
+    run_id = _run_id(task)
+    trace: Dict[str, object] = {
+        "run_id": run_id,
+        "task": task,
+        "stages": {},
+        "queries": [],
+        "sources": [],
+        "reflections": [],
+        "synthesis": None,
+        "cache_hits": {"llm": [], "search": []},
+    }
+
     max_iters = max_iters or int(os.environ.get("RESEARCH_MAX_ITERS", str(DEFAULT_MAX_ITERS)))
     max_queries = max_queries or int(
         os.environ.get("RESEARCH_MAX_QUERIES", str(DEFAULT_MAX_QUERIES))
@@ -302,11 +443,14 @@ def run_research(
         os.environ.get("RESEARCH_COMPACT_BEFORE_SYNTH", str(DEFAULT_COMPACT_BEFORE_SYNTH)).lower()
         == "true"
     )
+    llm_max_tokens = int(os.environ.get("RESEARCH_LLM_MAX_TOKENS", str(DEFAULT_LLM_MAX_TOKENS)))
+    temperature = 0.0
 
     agent_prompt = resolve_agent_prompt(agent_name, agent_id)
     user_task = build_user_task(agent_prompt, task)
 
     adapter = get_adapter()
+    model_name = getattr(adapter, "model", "unknown")
 
     plan_template = _load_prompt("plan_prompt.txt")
     reflect_template = _load_prompt("reflect_prompt.txt")
@@ -324,42 +468,83 @@ def run_research(
     compacted_once = False
     growth_forced = False
     growth_required = _growth_required(user_task)
+    storage_focus_forced = False
+    storage_focus_required = _storage_focus_required(user_task)
+    iterations_run = 0
+    fallback_used = False
+    executed_queries: List[str] = []
 
     for _ in range(max_iters):
+        iterations_run += 1
         if degraded_mode:
             break
         if pending_queries:
-            queries = pending_queries
+            queries = _dedupe_sort_queries(pending_queries)
             pending_queries = None
         else:
             # Plan
+            trace["stages"].setdefault("plan", []).append({"start": time.time()})
             plan_prompt = _render_prompt(plan_template, task=user_task)
-            plan_result = adapter.chat(
+            plan_cache_key = _llm_cache_key(
                 system=BASIC_SYSTEM_PROMPT,
-                messages=[{"role": "user", "content": plan_prompt}],
-                temperature=0.2,
-                force_json=True,
+                prompt=plan_prompt,
+                model=model_name,
+                temperature=temperature,
+                max_tokens=llm_max_tokens,
             )
+            plan_cached = _load_cache("llm", plan_cache_key)
+            if plan_cached:
+                plan_result = plan_cached
+                trace["cache_hits"]["llm"].append("plan")
+            else:
+                plan_result = adapter.chat(
+                    system=BASIC_SYSTEM_PROMPT,
+                    messages=[{"role": "user", "content": plan_prompt}],
+                    temperature=temperature,
+                    max_tokens=llm_max_tokens,
+                    force_json=True,
+                )
+                _save_cache("llm", plan_cache_key, plan_result)
+            trace["stages"]["plan"][-1]["end"] = time.time()
             try:
                 plan_payload = _parse_json(plan_result.get("content", ""))
                 plan = PlanResponse(**plan_payload)
             except Exception:
-                return _to_agent_error(
-                    "plan phase returned invalid JSON", plan_result.get("raw")
-                )
+                plan = PlanResponse(queries=_fallback_queries(user_task))
+                fallback_used = True
+            if not plan.queries:
+                plan = PlanResponse(queries=_fallback_queries(user_task))
+                fallback_used = True
 
-            queries = plan.queries[:max_queries]
+            queries = _dedupe_sort_queries(plan.queries)[:max_queries]
 
         # Search
+        trace["stages"].setdefault("search", []).append({"start": time.time()})
         for query in queries:
             if degraded_mode:
                 break
+            executed_queries.append(query.query)
             total_queries += 1
-            results, failed = _search_with_retry(
-                query.query,
-                max_sources=max_sources,
-                error_log=error_log,
-            )
+            search_key = _search_cache_key(query.query, max_sources)
+            cached_search = _load_cache("search", search_key)
+            if cached_search is not None:
+                results = [AgentSource(**item) for item in cached_search.get("results", [])]
+                failed = cached_search.get("failed", False)
+                trace["cache_hits"]["search"].append(query.query)
+            else:
+                results, failed = _search_with_retry(
+                    query.query,
+                    max_sources=max_sources,
+                    error_log=error_log,
+                )
+                _save_cache(
+                    "search",
+                    search_key,
+                    {
+                        "results": [item.model_dump() for item in results],
+                        "failed": failed,
+                    },
+                )
             if failed or not results:
                 consecutive_failures += 1
                 failed_count += 1
@@ -380,8 +565,10 @@ def run_research(
                 break
 
         all_sources = _dedupe_sources(_filter_sources(all_sources))
+        trace["stages"]["search"][-1]["end"] = time.time()
 
         # Reflect
+        trace["stages"].setdefault("reflect", []).append({"start": time.time()})
         reflect_sources, compacted, omitted_reflect, _ = _build_reflection_sources(
             all_sources,
             token_budget=token_budget,
@@ -396,21 +583,43 @@ def run_research(
             sources=reflect_sources,
             failed_queries=failed_block,
         )
-        reflect_result = adapter.chat(
+        reflect_cache_key = _llm_cache_key(
             system=BASIC_SYSTEM_PROMPT,
-            messages=[{"role": "user", "content": reflect_prompt}],
-            temperature=0.2,
-            force_json=True,
+            prompt=reflect_prompt,
+            model=model_name,
+            temperature=temperature,
+            max_tokens=llm_max_tokens,
         )
+        reflect_cached = _load_cache("llm", reflect_cache_key)
+        if reflect_cached:
+            reflect_result = reflect_cached
+            trace["cache_hits"]["llm"].append("reflect")
+        else:
+            reflect_result = adapter.chat(
+                system=BASIC_SYSTEM_PROMPT,
+                messages=[{"role": "user", "content": reflect_prompt}],
+                temperature=temperature,
+                max_tokens=llm_max_tokens,
+                force_json=True,
+            )
+            _save_cache("llm", reflect_cache_key, reflect_result)
+        trace["stages"]["reflect"][-1]["end"] = time.time()
         try:
             reflect_payload = _parse_json(reflect_result.get("content", ""))
             reflection = ReflectionResponse(**reflect_payload)
         except Exception:
+            _write_trace(trace)
             return _to_agent_error(
                 "reflection phase returned invalid JSON", reflect_result.get("raw")
             )
+        trace["reflections"].append(reflection.model_dump())
 
         growth_missing = growth_required and not _growth_covered(all_sources)
+        storage_missing = storage_focus_required and _storage_focus_missing(all_sources)
+        if reflection.sufficient and storage_missing and not storage_focus_forced and not degraded_mode:
+            storage_focus_forced = True
+            pending_queries = _storage_focus_query_fallback()[:max_queries]
+            continue
         if reflection.sufficient and growth_missing and not growth_forced and not degraded_mode:
             growth_forced = True
             pending_queries = _growth_query_fallback(user_task)[:max_queries]
@@ -425,6 +634,7 @@ def run_research(
             break
 
     # Synthesize
+    trace["stages"].setdefault("synthesize", []).append({"start": time.time()})
     synthesis_sources_list, synth_sources_text, synth_compacted, omitted_synth, _ = _build_synthesis_sources(
         all_sources,
         token_budget=token_budget,
@@ -434,21 +644,40 @@ def run_research(
     if synth_compacted and omitted_synth > 0:
         compacted_once = True
     synth_prompt = _render_prompt(synth_template, task=user_task, sources=synth_sources_text)
-    synth_result = adapter.chat(
+    synth_cache_key = _llm_cache_key(
         system=BASIC_SYSTEM_PROMPT,
-        messages=[{"role": "user", "content": synth_prompt}],
-        temperature=0.2,
-        force_json=True,
+        prompt=synth_prompt,
+        model=model_name,
+        temperature=temperature,
+        max_tokens=llm_max_tokens,
     )
+    synth_cached = _load_cache("llm", synth_cache_key)
+    if synth_cached:
+        synth_result = synth_cached
+        trace["cache_hits"]["llm"].append("synthesize")
+    else:
+        synth_result = adapter.chat(
+            system=BASIC_SYSTEM_PROMPT,
+            messages=[{"role": "user", "content": synth_prompt}],
+            temperature=temperature,
+            max_tokens=llm_max_tokens,
+            force_json=True,
+        )
+        _save_cache("llm", synth_cache_key, synth_result)
+    trace["stages"]["synthesize"][-1]["end"] = time.time()
     try:
         synth_payload = _parse_json(synth_result.get("content", ""))
         synthesis = SynthesisResponse(**synth_payload)
     except Exception:
+        _write_trace(trace)
         return _to_agent_error("synthesis phase returned invalid JSON", synth_result.get("raw"))
 
     id_map = {entry["id"]: entry for entry in _assign_source_ids(synthesis_sources_list)}
     raw_citations = [c.model_dump() for c in synthesis.citations]
     citations, invalid_ids = _validate_citations(raw_citations, id_map)
+    trace["queries"] = executed_queries
+    trace["sources"] = [s.model_dump() for s in all_sources]
+    trace["synthesis"] = synthesis.model_dump()
 
     risks: List[str] = []
     if degraded_mode:
@@ -460,6 +689,24 @@ def run_research(
     if not _has_authoritative_sources(all_sources):
         risks.append("No top-tier analyst or major tech news sources found.")
 
+    metadata = {
+        "iterations": iterations_run,
+        "model": model_name,
+        "max_tokens": llm_max_tokens,
+        "queries_count": len(executed_queries),
+        "sources_count": len(all_sources),
+        "forced_flags": {
+            "fallback_query_used": fallback_used,
+            "cache_hit": {
+                "llm": trace["cache_hits"]["llm"],
+                "search": trace["cache_hits"]["search"],
+            },
+        },
+    }
+
+    trace_path = TRACE_DIR / f"{run_id}.json"
+    trace_path.write_text(json.dumps(trace, indent=2), encoding="utf-8")
+
     return AgentResponse(
         summary=synthesis.answer,
         key_findings=[],
@@ -468,4 +715,5 @@ def run_research(
         open_questions=[],
         sources=citations,
         raw=synth_result.get("raw"),
+        metadata=metadata,
     )
