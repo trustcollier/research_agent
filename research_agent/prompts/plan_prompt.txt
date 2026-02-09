@@ -10,6 +10,7 @@ Constraints:
 - Provide 3 to 6 queries.
 - Queries should be short, specific, and actionable for web search.
 - Each intent should explain why the query is needed.
+- Include at least one query targeting year-over-year growth rates (use “YoY” or “year-over-year”).
 
 Task:
 {{TASK}}

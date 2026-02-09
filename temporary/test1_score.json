@@ -1,0 +1,9 @@
+{
+  "correctness": 30,
+  "citation_quality": 30,
+  "structural_compliance": 20,
+  "total": 80,
+  "max_total": 90,
+  "pass": true,
+  "failures": []
+}

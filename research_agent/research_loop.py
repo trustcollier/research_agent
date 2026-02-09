@@ -23,13 +23,13 @@ from .tools.web_search import search_web
 PROMPTS_DIR = Path(__file__).resolve().parent / "prompts"
 
 DEFAULT_MAX_ITERS = 2
-DEFAULT_MAX_QUERIES = 6
-DEFAULT_MAX_SOURCES = 5
+DEFAULT_MAX_QUERIES = 10
+DEFAULT_MAX_SOURCES = 15
 DEFAULT_MAX_RETRIES = 3
 MIN_RESULTS_PER_QUERY = 3
-DEFAULT_TOKEN_BUDGET = 50000
-DEFAULT_COMPACT_KEEP_RECENT = 10
-DEFAULT_COMPACT_BEFORE_SYNTH = True
+DEFAULT_TOKEN_BUDGET = 120000
+DEFAULT_COMPACT_KEEP_RECENT = 20
+DEFAULT_COMPACT_BEFORE_SYNTH = False
 
 BASIC_SYSTEM_PROMPT = "You are a helpful research assistant. Return JSON only."
 
@@ -168,6 +168,38 @@ def _dedupe_sources(sources: List[AgentSource]) -> List[AgentSource]:
     return deduped
 
 
+def _growth_required(task: str) -> bool:
+    lowered = task.lower()
+    return "growth" in lowered or "year-over-year" in lowered or "yoy" in lowered
+
+
+def _growth_covered(sources: List[AgentSource]) -> bool:
+    keywords = ("growth", "year-over-year", "yoy")
+    for source in sources:
+        title = (source.title or "").lower()
+        location = (source.location or "").lower()
+        if any(k in title for k in keywords) or any(k in location for k in keywords):
+            return True
+    return False
+
+
+def _growth_query_fallback(task: str) -> List[PlanQuery]:
+    return [
+        PlanQuery(
+            query=f"{task} year-over-year growth rate 2024 2025",
+            intent="find YoY growth rate data",
+        ),
+        PlanQuery(
+            query="Dropbox Google Drive OneDrive growth rate 2024 YoY",
+            intent="find provider-specific growth figures",
+        ),
+        PlanQuery(
+            query="cloud storage market growth rate by provider 2024 2025",
+            intent="find market growth data by vendor",
+        ),
+    ]
+
+
 def _validate_citations(
     citations: List[Dict[str, str]],
     id_map: Dict[str, Dict[str, str]],
@@ -258,6 +290,8 @@ def run_research(
     failed_count = 0
     degraded_mode = False
     compacted_once = False
+    growth_forced = False
+    growth_required = _growth_required(user_task)
 
     for _ in range(max_iters):
         if degraded_mode:
@@ -340,6 +374,12 @@ def run_research(
             return _to_agent_error(
                 "reflection phase returned invalid JSON", reflect_result.get("raw")
             )
+
+        growth_missing = growth_required and not _growth_covered(all_sources)
+        if reflection.sufficient and growth_missing and not growth_forced and not degraded_mode:
+            growth_forced = True
+            pending_queries = _growth_query_fallback(user_task)[:max_queries]
+            continue
 
         if reflection.sufficient or degraded_mode:
             break
