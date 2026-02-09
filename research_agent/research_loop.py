@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import json
 import os
+import random
+import time
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 from .prompting import build_user_task, resolve_agent_prompt
 from .router import get_adapter
@@ -23,6 +25,8 @@ PROMPTS_DIR = Path(__file__).resolve().parent / "prompts"
 DEFAULT_MAX_ITERS = 2
 DEFAULT_MAX_QUERIES = 6
 DEFAULT_MAX_SOURCES = 5
+DEFAULT_MAX_RETRIES = 3
+MIN_RESULTS_PER_QUERY = 3
 
 BASIC_SYSTEM_PROMPT = "You are a helpful research assistant. Return JSON only."
 
@@ -31,10 +35,17 @@ def _load_prompt(name: str) -> str:
     return (PROMPTS_DIR / name).read_text(encoding="utf-8")
 
 
-def _render_prompt(template: str, *, task: str, sources: str = "") -> str:
+def _render_prompt(
+    template: str,
+    *,
+    task: str,
+    sources: str = "",
+    failed_queries: str = "",
+) -> str:
     return (
         template.replace("{{TASK}}", task)
         .replace("{{SOURCES}}", sources)
+        .replace("{{FAILED_QUERIES}}", failed_queries)
     )
 
 
@@ -101,6 +112,20 @@ def _dedupe_sources(sources: List[AgentSource]) -> List[AgentSource]:
     return deduped
 
 
+def _search_with_retry(query: str, *, max_sources: int, error_log: List[Dict[str, str]]) -> Tuple[List[AgentSource], bool]:
+    for attempt in range(DEFAULT_MAX_RETRIES):
+        try:
+            results = search_web(query, limit=max_sources)
+            if results:
+                return results, False
+        except Exception as exc:
+            error_log.append({"phase": "search", "query": query, "error": str(exc)})
+        if attempt < DEFAULT_MAX_RETRIES - 1:
+            sleep_time = min((2 ** attempt) + random.uniform(0, 1), 10)
+            time.sleep(sleep_time)
+    return [], True
+
+
 def run_research(
     task: str,
     *,
@@ -132,34 +157,76 @@ def run_research(
 
     all_sources: List[AgentSource] = []
     queries: List[PlanQuery] = []
+    pending_queries: Optional[List[PlanQuery]] = None
+    failed_queries: List[str] = []
+    error_log: List[Dict[str, str]] = []
+    consecutive_failures = 0
+    total_queries = 0
+    failed_count = 0
+    degraded_mode = False
 
     for _ in range(max_iters):
-        # Plan
-        plan_prompt = _render_prompt(plan_template, task=user_task)
-        plan_result = adapter.chat(
-            system=BASIC_SYSTEM_PROMPT,
-            messages=[{"role": "user", "content": plan_prompt}],
-            temperature=0.2,
-            force_json=True,
-        )
-        try:
-            plan_payload = _parse_json(plan_result.get("content", ""))
-            plan = PlanResponse(**plan_payload)
-        except Exception:
-            return _to_agent_error("plan phase returned invalid JSON", plan_result.get("raw"))
+        if degraded_mode:
+            break
+        if pending_queries:
+            queries = pending_queries
+            pending_queries = None
+        else:
+            # Plan
+            plan_prompt = _render_prompt(plan_template, task=user_task)
+            plan_result = adapter.chat(
+                system=BASIC_SYSTEM_PROMPT,
+                messages=[{"role": "user", "content": plan_prompt}],
+                temperature=0.2,
+                force_json=True,
+            )
+            try:
+                plan_payload = _parse_json(plan_result.get("content", ""))
+                plan = PlanResponse(**plan_payload)
+            except Exception:
+                return _to_agent_error(
+                    "plan phase returned invalid JSON", plan_result.get("raw")
+                )
 
-        queries = plan.queries[:max_queries]
+            queries = plan.queries[:max_queries]
 
         # Search
         for query in queries:
-            results = search_web(query.query, limit=max_sources)
-            all_sources.extend(results)
+            if degraded_mode:
+                break
+            total_queries += 1
+            results, failed = _search_with_retry(
+                query.query,
+                max_sources=max_sources,
+                error_log=error_log,
+            )
+            if failed or not results:
+                consecutive_failures += 1
+                failed_count += 1
+            else:
+                consecutive_failures = 0
+            if results:
+                all_sources.extend(results)
+                if len(results) < MIN_RESULTS_PER_QUERY:
+                    failed_queries.append(query.query)
+            else:
+                failed_queries.append(query.query)
+
+            if consecutive_failures >= 3 or (total_queries >= 4 and failed_count / total_queries >= 0.5):
+                degraded_mode = True
+                break
 
         all_sources = _dedupe_sources(all_sources)
 
         # Reflect
         reflect_sources = _format_sources_for_reflection(all_sources)
-        reflect_prompt = _render_prompt(reflect_template, task=user_task, sources=reflect_sources)
+        failed_block = "\n".join(f"- {q}" for q in failed_queries) if failed_queries else "(none)"
+        reflect_prompt = _render_prompt(
+            reflect_template,
+            task=user_task,
+            sources=reflect_sources,
+            failed_queries=failed_block,
+        )
         reflect_result = adapter.chat(
             system=BASIC_SYSTEM_PROMPT,
             messages=[{"role": "user", "content": reflect_prompt}],
@@ -174,11 +241,11 @@ def run_research(
                 "reflection phase returned invalid JSON", reflect_result.get("raw")
             )
 
-        if reflection.sufficient:
+        if reflection.sufficient or degraded_mode:
             break
 
         if reflection.new_queries:
-            queries = reflection.new_queries[:max_queries]
+            pending_queries = reflection.new_queries[:max_queries]
         else:
             break
 
@@ -210,11 +277,15 @@ def run_research(
                 )
             )
 
+    risks: List[str] = []
+    if degraded_mode:
+        risks.append("Search degraded; answer may be based on partial information.")
+
     return AgentResponse(
         summary=synthesis.answer,
         key_findings=[],
         recommendations=[],
-        risks=[],
+        risks=risks,
         open_questions=[],
         sources=citations,
         raw=synth_result.get("raw"),

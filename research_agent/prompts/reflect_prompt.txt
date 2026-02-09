@@ -13,9 +13,13 @@ Guidelines:
 - If sources are insufficient, set sufficient=false and propose 2–4 new queries.
 - Confidence is 0.0–1.0.
 - Gaps should be concise.
+- For each failed query with weak results, reformulate using broader terms or synonyms.
 
 Task:
 {{TASK}}
 
 Sources:
 {{SOURCES}}
+
+Failed queries:
+{{FAILED_QUERIES}}
