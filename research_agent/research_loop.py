@@ -284,13 +284,13 @@ def run_research(
         all_sources = _dedupe_sources(all_sources)
 
         # Reflect
-        reflect_sources, compacted, _, _ = _build_reflection_sources(
-            all_sources,
-            token_budget=token_budget,
-            keep_recent=keep_recent,
-        )
-        if compacted:
-            compacted_once = True
+    reflect_sources, compacted, omitted_reflect, _ = _build_reflection_sources(
+        all_sources,
+        token_budget=token_budget,
+        keep_recent=keep_recent,
+    )
+    if compacted and omitted_reflect > 0:
+        compacted_once = True
         failed_block = "\n".join(f"- {q}" for q in failed_queries) if failed_queries else "(none)"
         reflect_prompt = _render_prompt(
             reflect_template,
@@ -321,13 +321,13 @@ def run_research(
             break
 
     # Synthesize
-    synthesis_sources_list, synth_sources_text, synth_compacted, _, _ = _build_synthesis_sources(
+    synthesis_sources_list, synth_sources_text, synth_compacted, omitted_synth, _ = _build_synthesis_sources(
         all_sources,
         token_budget=token_budget,
         keep_recent=keep_recent,
         force_compact=force_compact_before_synth,
     )
-    if synth_compacted:
+    if synth_compacted and omitted_synth > 0:
         compacted_once = True
     synth_prompt = _render_prompt(synth_template, task=user_task, sources=synth_sources_text)
     synth_result = adapter.chat(
