@@ -168,6 +168,35 @@ def _dedupe_sources(sources: List[AgentSource]) -> List[AgentSource]:
     return deduped
 
 
+def _validate_citations(
+    citations: List[Dict[str, str]],
+    id_map: Dict[str, Dict[str, str]],
+) -> Tuple[List[AgentSource], List[str]]:
+    valid: List[AgentSource] = []
+    invalid: List[str] = []
+    seen_locations = set()
+    for citation in citations:
+        citation_id = citation.get("id")
+        if not citation_id or citation_id not in id_map:
+            if citation_id:
+                invalid.append(citation_id)
+            continue
+        entry = id_map[citation_id]
+        location = entry.get("location")
+        if location and location in seen_locations:
+            continue
+        if location:
+            seen_locations.add(location)
+        valid.append(
+            AgentSource(
+                title=entry["title"],
+                type=entry["type"],
+                location=entry["location"],
+            )
+        )
+    return valid, invalid
+
+
 def _search_with_retry(query: str, *, max_sources: int, error_log: List[Dict[str, str]]) -> Tuple[List[AgentSource], bool]:
     for attempt in range(DEFAULT_MAX_RETRIES):
         try:
@@ -284,13 +313,13 @@ def run_research(
         all_sources = _dedupe_sources(all_sources)
 
         # Reflect
-    reflect_sources, compacted, omitted_reflect, _ = _build_reflection_sources(
-        all_sources,
-        token_budget=token_budget,
-        keep_recent=keep_recent,
-    )
-    if compacted and omitted_reflect > 0:
-        compacted_once = True
+        reflect_sources, compacted, omitted_reflect, _ = _build_reflection_sources(
+            all_sources,
+            token_budget=token_budget,
+            keep_recent=keep_recent,
+        )
+        if compacted and omitted_reflect > 0:
+            compacted_once = True
         failed_block = "\n".join(f"- {q}" for q in failed_queries) if failed_queries else "(none)"
         reflect_prompt = _render_prompt(
             reflect_template,
@@ -343,23 +372,16 @@ def run_research(
         return _to_agent_error("synthesis phase returned invalid JSON", synth_result.get("raw"))
 
     id_map = {entry["id"]: entry for entry in _assign_source_ids(synthesis_sources_list)}
-    citations: List[AgentSource] = []
-    for citation in synthesis.citations:
-        if citation.id in id_map:
-            entry = id_map[citation.id]
-            citations.append(
-                AgentSource(
-                    title=entry["title"],
-                    type=entry["type"],
-                    location=entry["location"],
-                )
-            )
+    raw_citations = [c.model_dump() for c in synthesis.citations]
+    citations, invalid_ids = _validate_citations(raw_citations, id_map)
 
     risks: List[str] = []
     if degraded_mode:
         risks.append("Search degraded; answer may be based on partial information.")
     if compacted_once:
         risks.append("Some sources were omitted due to context budget limits.")
+    if invalid_ids:
+        risks.append("Some citations were invalid and were omitted.")
 
     return AgentResponse(
         summary=synthesis.answer,
