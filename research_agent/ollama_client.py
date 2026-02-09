@@ -19,10 +19,10 @@ class OllamaResponse(TypedDict, total=False):
     raw: Dict[str, Any]
 
 
-def _post_json(url: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+def _post_json(url: str, payload: Dict[str, Any], *, timeout: int) -> Dict[str, Any]:
     data = json.dumps(payload).encode("utf-8")
     req = Request(url, data=data, headers={"Content-Type": "application/json"}, method="POST")
-    with urlopen(req, timeout=60) as resp:
+    with urlopen(req, timeout=timeout) as resp:
         body = resp.read().decode("utf-8")
     return json.loads(body)
 
@@ -35,10 +35,12 @@ def ollama_chat(
     temperature: Optional[float] = 0.2,
     max_tokens: Optional[int] = 800,
     host: Optional[str] = None,
+    timeout: Optional[int] = None,
     force_json: bool = True,
 ) -> OllamaResponse:
     endpoint = (host or os.environ.get("OLLAMA_HOST") or "http://127.0.0.1:11434").rstrip("/")
     url = f"{endpoint}/api/chat"
+    request_timeout = timeout or int(os.environ.get("OLLAMA_TIMEOUT", "120"))
 
     payload: Dict[str, Any] = {
         "model": model,
@@ -53,7 +55,7 @@ def ollama_chat(
     if force_json:
         payload["format"] = "json"
 
-    data = _post_json(url, payload)
+    data = _post_json(url, payload, timeout=request_timeout)
     message = data.get("message") or {}
 
     return {

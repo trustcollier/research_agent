@@ -12,8 +12,9 @@ def search_web(query: str, limit: int = 5) -> List[AgentSource]:
     api_key = os.environ.get("SERPAI_KEY", "")
     if not api_key:
         return []
+    timeout = int(os.environ.get("SERPAPI_TIMEOUT", "60"))
     params = {"q": query, "engine": "google", "api_key": api_key}
-    resp = requests.get("https://serpapi.com/search.json", params=params, timeout=20)
+    resp = requests.get("https://serpapi.com/search.json", params=params, timeout=timeout)
     if not resp.ok:
         return []
     data = resp.json()
