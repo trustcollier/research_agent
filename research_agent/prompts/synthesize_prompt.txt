@@ -11,6 +11,7 @@ Rules:
 - Use only the sources listed below.
 - Cite by source ID only.
 - Include only citations that directly support the answer.
+- If YoY growth data is not present in the sources, explicitly state it is unavailable.
 
 Task:
 {{TASK}}

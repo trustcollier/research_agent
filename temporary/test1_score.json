@@ -1,6 +1,6 @@
 {
-  "correctness": 30,
-  "citation_quality": 30,
+  "correctness": 40,
+  "citation_quality": 20,
   "structural_compliance": 20,
   "total": 80,
   "max_total": 90,

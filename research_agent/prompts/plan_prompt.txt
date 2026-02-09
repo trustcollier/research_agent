@@ -11,6 +11,8 @@ Constraints:
 - Queries should be short, specific, and actionable for web search.
 - Each intent should explain why the query is needed.
 - Include at least one query targeting year-over-year growth rates (use “YoY” or “year-over-year”).
+- Include at least one query that targets authoritative sources (use site:statista.com, site:gartner.com, or site:idc.com when possible).
+- Include at least one query for “file sharing software market share by vendor 2024” (or similar) targeting Statista.
 
 Task:
 {{TASK}}

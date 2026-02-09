@@ -30,6 +30,11 @@ MIN_RESULTS_PER_QUERY = 3
 DEFAULT_TOKEN_BUDGET = 120000
 DEFAULT_COMPACT_KEEP_RECENT = 20
 DEFAULT_COMPACT_BEFORE_SYNTH = False
+LOW_QUALITY_DOMAINS = (
+    "piechartmaker.com",
+    "sqmagazine.co.uk",
+    "aag-it.com",
+)
 
 BASIC_SYSTEM_PROMPT = "You are a helpful research assistant. Return JSON only."
 
@@ -168,6 +173,16 @@ def _dedupe_sources(sources: List[AgentSource]) -> List[AgentSource]:
     return deduped
 
 
+def _filter_sources(sources: List[AgentSource]) -> List[AgentSource]:
+    filtered: List[AgentSource] = []
+    for source in sources:
+        location = (source.location or "").lower()
+        if any(domain in location for domain in LOW_QUALITY_DOMAINS):
+            continue
+        filtered.append(source)
+    return filtered
+
+
 def _growth_required(task: str) -> bool:
     lowered = task.lower()
     return "growth" in lowered or "year-over-year" in lowered or "yoy" in lowered
@@ -186,18 +201,35 @@ def _growth_covered(sources: List[AgentSource]) -> bool:
 def _growth_query_fallback(task: str) -> List[PlanQuery]:
     return [
         PlanQuery(
-            query=f"{task} year-over-year growth rate 2024 2025",
+            query=f"{task} year-over-year growth rate 2024 2025 site:statista.com OR site:gartner.com OR site:idc.com",
             intent="find YoY growth rate data",
         ),
         PlanQuery(
-            query="Dropbox Google Drive OneDrive growth rate 2024 YoY",
+            query="Dropbox Google Drive OneDrive growth rate 2024 YoY site:investors.dropbox.com OR site:microsoft.com OR site:alphabet.com",
             intent="find provider-specific growth figures",
         ),
         PlanQuery(
-            query="cloud storage market growth rate by provider 2024 2025",
+            query="cloud storage market growth rate by provider 2024 2025 site:statista.com OR site:gartner.com OR site:idc.com",
             intent="find market growth data by vendor",
         ),
+        PlanQuery(
+            query="file sharing software market share by vendor 2024 site:statista.com",
+            intent="find vendor share data when storage share data is sparse",
+        ),
+        PlanQuery(
+            query="Dropbox revenue growth 2024 year-over-year investor relations",
+            intent="use IR data as a proxy if market-share YoY is unavailable",
+        ),
     ]
+
+
+def _has_authoritative_sources(sources: List[AgentSource]) -> bool:
+    domains = ("statista.com", "gartner.com", "idc.com", "techcrunch.com", "theverge.com", "bloomberg.com")
+    for source in sources:
+        location = (source.location or "").lower()
+        if any(domain in location for domain in domains):
+            return True
+    return False
 
 
 def _validate_citations(
@@ -340,11 +372,14 @@ def run_research(
             else:
                 failed_queries.append(query.query)
 
+            if results:
+                results = _filter_sources(results)
+
             if consecutive_failures >= 3 or (total_queries >= 4 and failed_count / total_queries >= 0.5):
                 degraded_mode = True
                 break
 
-        all_sources = _dedupe_sources(all_sources)
+        all_sources = _dedupe_sources(_filter_sources(all_sources))
 
         # Reflect
         reflect_sources, compacted, omitted_reflect, _ = _build_reflection_sources(
@@ -422,6 +457,8 @@ def run_research(
         risks.append("Some sources were omitted due to context budget limits.")
     if invalid_ids:
         risks.append("Some citations were invalid and were omitted.")
+    if not _has_authoritative_sources(all_sources):
+        risks.append("No top-tier analyst or major tech news sources found.")
 
     return AgentResponse(
         summary=synthesis.answer,

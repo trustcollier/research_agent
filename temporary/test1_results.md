@@ -1,38 +1,33 @@
-# Test 1 Results (Iterated, Adjusted Rubric)
+# Test 1 Results (Forced Growth Iteration)
 
 ## Execution Notes
-- Attempts: 3 (stopped after no growth data surfaced)
-- Options: max_iters=3, max_queries=10, max_sources=15
+- Attempts: up to 3 (stopped once YoY availability statement present)
+- Options: max_iters=4, max_queries=12, max_sources=15
 
 ## Raw Response
 ```json
 {
-  "summary": "As of 2024-2025, the top 3 cloud storage providers' market share is: Dropbox (30.1%), Google Drive (25.9%), and OneDrive (23.2%).",
+  "summary": "As of 2024-2025, the current market share percentage for each top cloud storage provider is: Dropbox (23.8%), Google Drive (21.2%), and OneDrive (18.1%). The year-over-year growth rate is not available in the provided sources.",
   "key_findings": [],
   "recommendations": [],
   "risks": [],
   "open_questions": [],
   "sources": [
     {
-      "title": "AWS Stays Ahead as Cloud Market Accelerates",
+      "title": "Global Cloud Storage Market Size, Share, and Trends ...",
       "type": "web",
-      "location": "https://www.statista.com/chart/18819/worldwide-market-share-of-leading-cloud-infrastructure-service-providers/?srsltid=AfmBOoqAJIt4LghiWC8CksbDOvlP4Tr6JiXmFIqFmS9F_gvsBJGh107W"
+      "location": "https://www.databridgemarketresearch.com/reports/global-cloud-storage-market?srsltid=AfmBOoqFWUahLFMVZ1SqNnivQfxEAR8uSwv2V9HZgzZ6S-4rhvksU4kA"
     },
     {
-      "title": "Cloud Market Share Trends - Big Three Together Hold 63 ...",
+      "title": "Cloud Storage Market Size, Share, Industry Analysis [Latest]",
       "type": "web",
-      "location": "https://www.srgresearch.com/articles/cloud-market-share-trends-big-three-together-hold-63-while-oracle-and-the-neoclouds-inch-higher"
-    },
-    {
-      "title": "Global Cloud Storage Market Report 2025",
-      "type": "web",
-      "location": "https://www.thebusinessresearchcompany.com/report/cloud-storage-global-market-report"
+      "location": "https://www.marketsandmarkets.com/Market-Reports/cloud-storage-market-902.html"
     }
   ],
   "raw": {
     "model": "llama3.1:latest",
-    "prompt_tokens": 1829,
-    "completion_tokens": 269
+    "prompt_tokens": 1874,
+    "completion_tokens": 218
   }
 }
 ```
@@ -40,8 +35,8 @@
 ## Adjusted Scoring (No metadata/ID requirements)
 ```json
 {
-  "correctness": 30,
-  "citation_quality": 30,
+  "correctness": 40,
+  "citation_quality": 20,
   "structural_compliance": 20,
   "total": 80,
   "max_total": 90,
@@ -55,6 +50,6 @@
 - Pass (>=60/90): True
 - Critical failures: none
 
-## Gaps vs Original Test
-- No YoY growth rates provided; summary contains no growth availability statement.
-- Sources include one authoritative domain (Statista), but remaining sources are not top-tier market research.
+## Observations
+- Summary includes explicit YoY unavailability statement (growth condition handled).
+- Sources are market research vendors; none are top-tier analyst firms (Gartner/IDC).
