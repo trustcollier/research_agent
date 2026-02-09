@@ -27,6 +27,9 @@ DEFAULT_MAX_QUERIES = 6
 DEFAULT_MAX_SOURCES = 5
 DEFAULT_MAX_RETRIES = 3
 MIN_RESULTS_PER_QUERY = 3
+DEFAULT_TOKEN_BUDGET = 50000
+DEFAULT_COMPACT_KEEP_RECENT = 10
+DEFAULT_COMPACT_BEFORE_SYNTH = True
 
 BASIC_SYSTEM_PROMPT = "You are a helpful research assistant. Return JSON only."
 
@@ -100,6 +103,59 @@ def _format_sources_for_synthesis(sources: List[AgentSource]) -> str:
     return "\n".join(lines)
 
 
+def _estimate_tokens(text: str) -> int:
+    # Rough heuristic: ~4 chars per token
+    return max(1, len(text) // 4)
+
+
+def _compact_sources(
+    sources: List[AgentSource],
+    *,
+    keep_recent: int,
+) -> Tuple[List[AgentSource], int]:
+    if len(sources) <= keep_recent:
+        return sources, 0
+    omitted = len(sources) - keep_recent
+    return sources[-keep_recent:], omitted
+
+
+def _build_reflection_sources(
+    sources: List[AgentSource],
+    *,
+    token_budget: int,
+    keep_recent: int,
+) -> Tuple[str, bool, int, int]:
+    full_text = _format_sources_for_reflection(sources)
+    if _estimate_tokens(full_text) <= token_budget:
+        return full_text, False, 0, token_budget - _estimate_tokens(full_text)
+
+    compacted, omitted = _compact_sources(sources, keep_recent=keep_recent)
+    compact_text = _format_sources_for_reflection(compacted)
+    header = f"(omitted {omitted} older sources due to context budget)\n"
+    final_text = header + compact_text if compact_text else header + "(no sources)"
+    remaining = max(0, token_budget - _estimate_tokens(final_text))
+    return final_text, True, omitted, remaining
+
+
+def _build_synthesis_sources(
+    sources: List[AgentSource],
+    *,
+    token_budget: int,
+    keep_recent: int,
+    force_compact: bool,
+) -> Tuple[List[AgentSource], str, bool, int, int]:
+    full_text = _format_sources_for_synthesis(sources)
+    if not force_compact and _estimate_tokens(full_text) <= token_budget:
+        return sources, full_text, False, 0, token_budget - _estimate_tokens(full_text)
+
+    compacted, omitted = _compact_sources(sources, keep_recent=keep_recent)
+    compact_text = _format_sources_for_synthesis(compacted)
+    header = f"(omitted {omitted} older sources due to context budget)\n"
+    final_text = header + compact_text if compact_text else header + "(no sources)"
+    remaining = max(0, token_budget - _estimate_tokens(final_text))
+    return compacted, final_text, True, omitted, remaining
+
+
 def _dedupe_sources(sources: List[AgentSource]) -> List[AgentSource]:
     seen = set()
     deduped: List[AgentSource] = []
@@ -145,6 +201,14 @@ def run_research(
     max_sources = max_sources or int(
         os.environ.get("RESEARCH_MAX_SOURCES", str(DEFAULT_MAX_SOURCES))
     )
+    token_budget = int(os.environ.get("RESEARCH_TOKEN_BUDGET", str(DEFAULT_TOKEN_BUDGET)))
+    keep_recent = int(
+        os.environ.get("RESEARCH_COMPACT_KEEP_RECENT", str(DEFAULT_COMPACT_KEEP_RECENT))
+    )
+    force_compact_before_synth = (
+        os.environ.get("RESEARCH_COMPACT_BEFORE_SYNTH", str(DEFAULT_COMPACT_BEFORE_SYNTH)).lower()
+        == "true"
+    )
 
     agent_prompt = resolve_agent_prompt(agent_name, agent_id)
     user_task = build_user_task(agent_prompt, task)
@@ -164,6 +228,7 @@ def run_research(
     total_queries = 0
     failed_count = 0
     degraded_mode = False
+    compacted_once = False
 
     for _ in range(max_iters):
         if degraded_mode:
@@ -219,7 +284,13 @@ def run_research(
         all_sources = _dedupe_sources(all_sources)
 
         # Reflect
-        reflect_sources = _format_sources_for_reflection(all_sources)
+        reflect_sources, compacted, _, _ = _build_reflection_sources(
+            all_sources,
+            token_budget=token_budget,
+            keep_recent=keep_recent,
+        )
+        if compacted:
+            compacted_once = True
         failed_block = "\n".join(f"- {q}" for q in failed_queries) if failed_queries else "(none)"
         reflect_prompt = _render_prompt(
             reflect_template,
@@ -250,8 +321,15 @@ def run_research(
             break
 
     # Synthesize
-    synth_sources = _format_sources_for_synthesis(all_sources)
-    synth_prompt = _render_prompt(synth_template, task=user_task, sources=synth_sources)
+    synthesis_sources_list, synth_sources_text, synth_compacted, _, _ = _build_synthesis_sources(
+        all_sources,
+        token_budget=token_budget,
+        keep_recent=keep_recent,
+        force_compact=force_compact_before_synth,
+    )
+    if synth_compacted:
+        compacted_once = True
+    synth_prompt = _render_prompt(synth_template, task=user_task, sources=synth_sources_text)
     synth_result = adapter.chat(
         system=BASIC_SYSTEM_PROMPT,
         messages=[{"role": "user", "content": synth_prompt}],
@@ -264,7 +342,7 @@ def run_research(
     except Exception:
         return _to_agent_error("synthesis phase returned invalid JSON", synth_result.get("raw"))
 
-    id_map = {entry["id"]: entry for entry in _assign_source_ids(all_sources)}
+    id_map = {entry["id"]: entry for entry in _assign_source_ids(synthesis_sources_list)}
     citations: List[AgentSource] = []
     for citation in synthesis.citations:
         if citation.id in id_map:
@@ -280,6 +358,8 @@ def run_research(
     risks: List[str] = []
     if degraded_mode:
         risks.append("Search degraded; answer may be based on partial information.")
+    if compacted_once:
+        risks.append("Some sources were omitted due to context budget limits.")
 
     return AgentResponse(
         summary=synthesis.answer,
