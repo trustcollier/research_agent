@@ -1,100 +1,66 @@
 from __future__ import annotations
 
-import json
-import os
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Optional
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 from dotenv import load_dotenv
 
-from .agents_store import list_agents
-from .ollama_client import ollama_chat
-from .schemas import AgentRequest, AgentResponse
+from .research_loop import run_research
+from .schemas import AgentRequest, AgentResponse, WebSearchRequest
 from .tools.web_search import search_web
 
 
 APP = FastAPI()
 
-DEFAULT_MODEL = "llama3.1:latest"
-DEFAULT_MAX_TOKENS = 1600
-PROMPT_PATH = Path(__file__).resolve().parent / "prompts" / "system_prompt.txt"
 ENV_PATH = Path(__file__).resolve().parent / ".env"
 
 load_dotenv(ENV_PATH)
 
 
-def load_system_prompt() -> str:
-    return PROMPT_PATH.read_text(encoding="utf-8")
-
-
-def _resolve_agent_prompt(agent_name: Optional[str], agent_id: Optional[str]) -> Optional[str]:
-    if not agent_name and not agent_id:
-        return None
-    agents = list_agents()
-    for agent in agents:
-        if agent_id and agent.get("id") == agent_id:
-            return agent.get("prompt")
-        if agent_name and agent.get("name") == agent_name:
-            return agent.get("prompt")
-    return None
-
-
-def _build_user_task(agent_prompt: Optional[str], task: str) -> str:
-    if agent_prompt:
-        return f"{agent_prompt}\n\n{task}"
-    return task
-
-
-def _fallback_response(content: str, raw: Dict[str, Any]) -> AgentResponse:
-    reason = "Model did not return structured JSON."
-    return AgentResponse(
+def _error_response(reason: str, status_code: int = 502) -> JSONResponse:
+    response = AgentResponse(
         summary=f"ERROR: {reason}",
         key_findings=[],
         recommendations=[],
         risks=[reason],
         open_questions=[],
         sources=[],
-        raw=raw,
+        raw=None,
     )
-
-
-def _parse_agent_response(content: str, raw: Dict[str, Any]) -> AgentResponse:
-    try:
-        payload = json.loads(content)
-        response = AgentResponse(**payload)
-        response.raw = raw
-        return response
-    except Exception:
-        return _fallback_response(content, raw)
+    return JSONResponse(status_code=status_code, content=response.model_dump())
 
 
 @APP.post("/run")
 async def run_agent(request: AgentRequest):
-    model = os.environ.get("OLLAMA_MODEL") or DEFAULT_MODEL
-    max_tokens = int(os.environ.get("OLLAMA_MAX_TOKENS", str(DEFAULT_MAX_TOKENS)))
-    agent_prompt = _resolve_agent_prompt(request.agent_name, request.agent_id)
-    user_task = _build_user_task(agent_prompt, request.task)
+    max_iters: Optional[int] = None
+    max_queries: Optional[int] = None
+    max_sources: Optional[int] = None
+    if request.options and isinstance(request.options, dict):
+        max_iters = request.options.get("max_iters")
+        max_queries = request.options.get("max_queries")
+        max_sources = request.options.get("max_sources")
 
     try:
-        result = ollama_chat(
-            model=model,
-            system=load_system_prompt(),
-            messages=[{"role": "user", "content": user_task}],
-            temperature=0.2,
-            max_tokens=max_tokens,
-            force_json=True,
+        response = run_research(
+            request.task,
+            agent_name=request.agent_name,
+            agent_id=request.agent_id,
+            max_iters=max_iters,
+            max_queries=max_queries,
+            max_sources=max_sources,
         )
     except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"Ollama request failed: {exc}") from exc
-
-    response = _parse_agent_response(result.get("content", ""), result.get("raw", {}))
-
-    include_web = False
-    if request.options and isinstance(request.options, dict):
-        include_web = bool(request.options.get("include_web"))
-    if include_web:
-        response.sources = search_web(request.task, limit=5)
+        return _error_response(f"Research loop failed: {exc}")
 
     return JSONResponse(status_code=200, content=response.model_dump())
+
+
+@APP.post("/search")
+async def web_search(request: WebSearchRequest):
+    sources = search_web(request.query, limit=request.limit)
+    return JSONResponse(
+        status_code=200,
+        content=[source.model_dump() for source in sources],
+    )

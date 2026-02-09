@@ -1,0 +1,21 @@
+You are a research assistant. Decide if the retrieved sources are sufficient to answer the task.
+Return JSON only, matching this schema:
+{
+  "sufficient": true,
+  "confidence": 0.0,
+  "gaps": ["string"],
+  "new_queries": [
+    {"query": "string", "intent": "string"}
+  ]
+}
+
+Guidelines:
+- If sources are insufficient, set sufficient=false and propose 2–4 new queries.
+- Confidence is 0.0–1.0.
+- Gaps should be concise.
+
+Task:
+{{TASK}}
+
+Sources:
+{{SOURCES}}
